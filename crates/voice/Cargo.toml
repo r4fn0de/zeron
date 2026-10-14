@@ -16,6 +16,23 @@ sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# ort-sys (ONNX Runtime, reached through parakeet-rs) publishes no prebuilt
+# binary for Intel mac: ort-sys 2.0.0-rc.13 pins ONNX Runtime 1.28, and
+# upstream dropped the osx-x86_64 artifacts after 1.23 (1.24+ ship osx-arm64
+# only), so there is nothing for the build script to download.
+#
+# `load-dynamic` forwards to ort/load-dynamic -> ort-sys/disable-linking, which
+# makes ort-sys's build script return before it tries to fetch a prebuilt, and
+# dlopen libonnxruntime.dylib at runtime instead. Without that dylib the
+# parakeet call panics inside ort's lazy API setup, but the dictation worker
+# already wraps run_job in catch_unwind, so it surfaces as "Dictation stopped
+# unexpectedly. Your draft is safe." and cloud dictation is unaffected.
+#
+# Scoped to x86_64 on purpose: the arm64 release keeps static linking against
+# the prebuilt onnxruntime and local Parakeet transcription works there.
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+parakeet-rs = { version = "=0.3.8", features = ["load-dynamic"] }
+
 [dev-dependencies]
 hound = "3.5"
 tempfile.workspace = true
