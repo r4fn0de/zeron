@@ -1,0 +1,105 @@
+name: macOS x86_64 package
+
+# On-demand Intel build. GitHub's arm64 `macos-latest` image cannot produce an
+# x86_64 artifact, and the app's local Parakeet speech model is the only piece
+# of the workspace that still targets Intel macOS at all — so this job runs on
+# `macos-15-intel`, the last x86_64 image GitHub offers (retired Aug 2027).
+#
+# It is deliberately separate from release.yml: the release pipeline's version
+# guard and updater manifest are wired for `macos-arm64` only, and folding an
+# Intel job in there changes what a tagged release publishes. This workflow only
+# ever uploads an artifact, so it is safe to run on demand.
+#
+# Feature difference vs the arm64 release: crates/voice turns on
+# parakeet-rs/load-dynamic for `x86_64-apple-darwin`, so ort-sys skips its
+# prebuilt ONNX Runtime (Microsoft ships no osx-x86_64 build for the pinned
+# 1.28). The app runs, but on-device dictation reports "Dictation stopped
+# unexpectedly" because libonnxruntime.dylib is absent; cloud dictation is
+# unaffected. arm64 keeps static linking and full local transcription.
+#
+# Usage: Actions → macOS x86_64 package → Run workflow. Download
+# `macos-x64` afterwards.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      # Job-level (not workflow-level) so the `if:` guards below can read them,
+      # matching release.yml. Absent secrets leave the build ad-hoc-signed.
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: import Developer ID certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          pass="$(openssl rand -hex 16)"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$MACOS_CERT_P12" | base64 -d >"$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+          [ -n "$identity" ] || { echo "p12 contains no Developer ID Application identity"; exit 1; }
+          echo "CODESIGN_IDENTITY=$identity" >>"$GITHUB_ENV"
+      - name: notary credentials
+        if: env.AC_API_KEY_P8 != ''
+        run: |
+          printf '%s' "$AC_API_KEY_P8" >"$RUNNER_TEMP/ac_api_key.p8"
+          {
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/ac_api_key.p8"
+            echo "NOTARY_KEY_ID=$AC_API_KEY_ID"
+            echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID"
+          } >>"$GITHUB_ENV"
+      - name: package dmg
+        run: scripts/package-macos.sh
+      - name: verify artifact is x86_64
+        run: |
+          set -euo pipefail
+          bin=target/release/zeron
+          archs="$(lipo -archs "$bin")"
+          echo "binary arch: $archs"
+          [ "$archs" = "x86_64" ] || {
+            echo "::error::expected a single-arch x86_64 binary, got '$archs'"
+            exit 1
+          }
+          # package-macos.sh derives the filename from `uname -m`, so the dmg
+          # must carry -macos-x86_64 (not -arm64) or the updater's
+          # mac_app_artifact() lookup would never resolve.
+          ls -1 target/package/
+          ls target/package/zeron-*-macos-x86_64.dmg >/dev/null
+          ls target/package/zeron-*-macos-x86_64-app.tar.gz >/dev/null
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-x64
+          path: |
+            target/package/*.dmg
+            target/package/*.tar.gz
+          if-no-files-found: error
