@@ -17,6 +17,13 @@ name: macOS x86_64 package
 # unexpectedly" because libonnxruntime.dylib is absent; cloud dictation is
 # unaffected. arm64 keeps static linking and full local transcription.
 #
+# Packaging difference: the Intel image selects Xcode 16.4 by default, which
+# cannot compile Icon Composer's Zeron.icon, and also carries 26.x — so
+# scripts/macos-app-icon.sh compiles the catalog with the newest install it can
+# find. ALLOW_MISSING_ICON_CATALOG is a safety net for an image that carries no
+# Xcode 26 at all: the bundle then ships with zeron.icns alone instead of
+# failing after a 40-minute build.
+#
 # Usage: Actions → macOS x86_64 package → Run workflow. Download
 # `macos-x64` afterwards.
 
@@ -42,6 +49,10 @@ jobs:
       AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
       AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+      # The Intel image defaults to Xcode 16.4; macos-app-icon.sh switches to
+      # the 26.x install next to it. If none is present, keep zeron.icns and
+      # warn rather than fail the build at the packaging step.
+      ALLOW_MISSING_ICON_CATALOG: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: rust toolchain (rust-toolchain.toml)
