@@ -1,0 +1,154 @@
+name: macOS x86_64 package
+
+# On-demand Intel build. GitHub's arm64 `macos-latest` image cannot produce an
+# x86_64 artifact, and the app's local Parakeet speech model is the only piece
+# of the workspace that still targets Intel macOS at all — so this job runs on
+# `macos-15-intel`, the last x86_64 image GitHub offers (retired Aug 2027).
+#
+# It is deliberately separate from release.yml: the release pipeline's version
+# guard and updater manifest are wired for `macos-arm64` only, and folding an
+# Intel job in there changes what a tagged release publishes. This workflow only
+# ever uploads an artifact, so it is safe to run on demand.
+#
+# The pipeline follows zgx-build.yml's macOS job: the engine is built from
+# this commit with LUAU_CXXFLAGS=-DNDEBUG (the package script refuses one with
+# Luau's asserts), then scripts/package-zgx-macos.sh builds the zgx interface
+# (apps/zgx, its own workspace, --features beta) around it and signs,
+# notarizes and packages Zeron.app into target/package-zgx/. zgx's terminals
+# are Ghostty's, which builds with Zig 0.16.
+#
+# Feature difference vs the arm64 release: crates/voice turns on
+# parakeet-rs/load-dynamic for `x86_64-apple-darwin`, so ort-sys skips its
+# prebuilt ONNX Runtime (Microsoft ships no osx-x86_64 build for the pinned
+# 1.28). The app runs, but on-device dictation reports "Dictation stopped
+# unexpectedly" because libonnxruntime.dylib is absent; cloud dictation is
+# unaffected. arm64 keeps static linking and full local transcription.
+#
+# Packaging difference: the Intel image selects Xcode 16.4 by default, which
+# cannot compile Icon Composer's Zeron.icon, and also carries 26.x — so
+# scripts/macos-app-icon.sh compiles the catalog with the newest install it can
+# find. ALLOW_MISSING_ICON_CATALOG is a safety net for an image that carries no
+# Xcode 26 at all: the bundle then ships with zeron.icns alone instead of
+# failing after a 40-minute build.
+#
+# Usage: Actions → macOS x86_64 package → Run workflow. Download
+# `macos-x64` afterwards.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: macos-15-intel
+    timeout-minutes: 150
+    env:
+      # Job-level (not workflow-level) so the `if:` guards below can read them,
+      # matching release.yml. Absent secrets leave the build ad-hoc-signed.
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+      # The Intel image defaults to Xcode 16.4; macos-app-icon.sh switches to
+      # the 26.x install next to it. If none is present, keep zeron.icns and
+      # warn rather than fail the build at the packaging step.
+      ALLOW_MISSING_ICON_CATALOG: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      # zgx's terminals are Ghostty's, built with Zig 0.16 (zgx-ghostty-sys).
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/Library/Caches/zgx-ghostty
+          key: zgx-ghostty-${{ hashFiles('apps/zgx/Cargo.lock') }}
+          restore-keys: zgx-ghostty-
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Separate from the arm64 jobs' caches: same runner.os, other arch.
+          key: macos-x64
+          workspaces: |
+            . -> target
+            apps/zgx -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: workspace version
+        # No tag on workflow_dispatch: package-zgx-macos.sh wants ZGX_VERSION
+        # to be the workspace's (or a beta of it), which lives in Cargo.toml.
+        run: echo "ZGX_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" >>"$GITHUB_ENV"
+      - name: the engine, from this commit
+        env:
+          ZERON_ENGINE_VERSION: ${{ env.ZGX_VERSION }}
+          # Luau without its asserts (a fifth of script time). Here, not in a
+          # root .cargo/config.toml, so test builds keep them; the package
+          # script refuses an engine that has them.
+          LUAU_CXXFLAGS: -DNDEBUG
+        run: cargo build --release --locked -p zeron --bin zeron-engine
+      - name: import Developer ID certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          pass="$(openssl rand -hex 16)"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$MACOS_CERT_P12" | base64 -d >"$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+          [ -n "$identity" ] || { echo "p12 contains no Developer ID Application identity"; exit 1; }
+          echo "CODESIGN_IDENTITY=$identity" >>"$GITHUB_ENV"
+      - name: notary credentials
+        if: env.AC_API_KEY_P8 != ''
+        run: |
+          printf '%s' "$AC_API_KEY_P8" >"$RUNNER_TEMP/ac_api_key.p8"
+          {
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/ac_api_key.p8"
+            echo "NOTARY_KEY_ID=$AC_API_KEY_ID"
+            echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID"
+          } >>"$GITHUB_ENV"
+      - name: package dmg
+        env:
+          CARGO_FLAGS: --locked
+        run: ZGX_ENGINE="$GITHUB_WORKSPACE/target/release/zeron-engine" scripts/package-zgx-macos.sh
+      - name: verify artifact is x86_64
+        run: |
+          set -euo pipefail
+          for bin in \
+            "target/package-zgx/Zeron.app/Contents/MacOS/zeron" \
+            "target/package-zgx/Zeron.app/Contents/MacOS/Zeron Engine"; do
+            archs="$(lipo -archs "$bin")"
+            echo "$bin: $archs"
+            [ "$archs" = "x86_64" ] || {
+              echo "::error::expected a single-arch x86_64 binary, got '$archs'"
+              exit 1
+            }
+          done
+          # package-zgx-macos.sh derives the filename from `uname -m`, so the
+          # dmg must carry -macos-x86_64 (not -arm64) or the updater's
+          # mac_app_artifact() lookup would never resolve.
+          ls -1 target/package-zgx/
+          ls target/package-zgx/zeron-*-macos-x86_64.dmg >/dev/null
+          ls target/package-zgx/zeron-*-macos-x86_64-app.tar.gz >/dev/null
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-x64
+          path: |
+            target/package-zgx/*.dmg
+            target/package-zgx/*.tar.gz
+          if-no-files-found: error
